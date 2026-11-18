@@ -109,7 +109,8 @@ async function captureFailure(command, params) {
       { env: { ...process.env, COCO_RPC_LOG: '0' } },
       (error, stdout, stderr) => {
         if (!error) { reject(new Error(`comm.js unexpectedly succeeded: ${stdout}`)); return; }
-        resolve(JSON.parse(stderr));
+        // The last line: deprecated send verbs print a warning line first.
+        resolve(JSON.parse(stderr.trim().split('\n').pop()));
       },
     );
   });
@@ -660,10 +661,15 @@ test('ask_card sends an onboarding.channel card carrying all 12 channels', async
   assert.match(failure.error, /card was SENT/);
 });
 
-test('🔴 ask_card re-reads im_channels with the im_order its TZ selects, and refuses a reordered card', async () => {
+test('🔴 ask_card re-reads im_channels with the im_order its TZ selects, and refuses a reordered card', async (t) => {
+  // agentTimeZone() reads TZ= from the agent's zylos .env (ZYLOS_DIR, else
+  // $HOME/zylos) before TZ; an inherited ZYLOS_DIR whose .env sets TZ would
+  // decide the order instead of the TZ under test. Point it at an empty dir.
+  const emptyZylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'om-comm-tz-'));
+  t.after(() => fs.rmSync(emptyZylosDir, { recursive: true, force: true }));
   for (const [tz, want] of [['Asia/Shanghai', 'cn'], ['UTC', 'intl']]) {
     const { requests, failure } = await runWithProfileOptions(
-      imCard(IM12.map((c) => c.label)), { profileOptions: { im_channels: IM12 }, env: { TZ: tz } },
+      imCard(IM12.map((c) => c.label)), { profileOptions: { im_channels: IM12 }, env: { TZ: tz, ZYLOS_DIR: emptyZylosDir } },
     );
     const fetches = requests.filter((r) => r.url.startsWith('/api/v1/onboarding/profile-options'));
     assert.equal(fetches.length, 1, tz);
