@@ -27,7 +27,11 @@ import { loadConfig, watchConfig, enabledOrgs, bindOwner, setOwner, updateOwnerN
 import {
   POLICY_UPDATED_EVENT, handlePolicyUpdated, handleLegacyPolicyEvent, buildReportedPolicy,
 } from './lib/agent-policy.js';
-import { registerConvOrg, lookupConvOrg } from './lib/conv-org.js';
+import { registerConvOrg, lookupConvOrg, lookupConvRecord, convRecordFields } from './lib/conv-org.js';
+import { endpointKindOf, endpointKindOfRecord } from './lib/session-group.js';
+import {
+  forwardToC4, readInboundCaps, fetchConversationRecord, conversationKindPending, CARD_RETRY, TRY_LATER,
+} from './lib/c4-receive.js';
 import { createSelfNameHydrator } from './lib/self-name-hydration.js';
 import { WsClient, createDeduper } from './lib/ws.js';
 import { resolveInboundContent } from './lib/inbound-content.js';
@@ -46,10 +50,13 @@ import { formatStructuredForModel } from './lib/structured-body.js';
 import { isSiblingAgentSender } from './lib/dm-access.js';
 import { decideGroupAccess } from './lib/group-access.js';
 import { subConversationOf, fetchesConversationContext } from './lib/subconversation.js';
-import { recordParticipants } from './lib/mention.js';
 import { downloadInboundAttachment, collectInboundMedia } from './lib/inbound-media.js';
 import { getForOrg, postForOrg, putForOrg, delForOrg, apiPath, getForOrgWithHeaders } from './lib/client.js';
 import { createChannelInstaller } from './lib/channel-connector.js';
+import {
+  createBrowserRemoteConnector, isBrowserRemoteCommand, relayUrlFromBase, BROWSER_RECONCILE_INTERVAL_MS,
+} from './lib/browser-remote-connector.js';
+import { resolveAgentBaseUrl } from './lib/agent-domain.js';
 import { logSystemFrame } from './lib/system-events.js';
 import { createReceiptWatcher, CARD_RECORDED_EVENT } from './lib/receipt-watch.js';
 import { createDmSeenWatcher, resolveDmSeenConfig, drainSentMarkers, buildUnseenPrompt, SENT_DIR } from './lib/dm-seen-watch.js';
@@ -80,7 +87,7 @@ import {
   applyDiagnosticsConfig,
   createDiagnosticsHandler,
 } from './lib/diagnostics.js';
-import { isSelfMentioned } from './lib/self-mention.js';
+import { isSelfAddressed, isSelfMentioned } from './lib/self-mention.js';
 import { createActivity, shouldRegisterRun } from './lib/activity/index.js';
 
 const LOG_PREFIX = '[comm-bridge]';
@@ -151,10 +158,6 @@ const handleAgentDiagnostics = createDiagnosticsHandler({
   warn,
 });
 
-const C4_RECEIVE = path.join(
-  process.env.HOME || '',
-  'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js',
-);
 const C4_CONTROL = path.join(
   process.env.HOME || '',
   'zylos/.claude/skills/comm-bridge/scripts/c4-control.js',
@@ -364,31 +367,26 @@ async function processImOwnerNotice(orgConfig, imNotice) {
   });
 }
 
-function forwardToC4(endpoint, body, priority) {
-  // c4-receive.js only accepts named flags (--channel / --endpoint / --content
-  // / --json / --priority); the old positional invocation form
-  // `node c4-receive.js <channel> <endpoint> <body>` now rejects with
-  // "Unexpected argument: <channel>". execFile passes the array as argv
-  // directly, so no shell-escape is needed for content.
-  const args = ['--channel', CHANNEL, '--endpoint', endpoint, '--json'];
-  // System events map urgent/high/normal → 1/2/3 so urgent platform messages
-  // (e.g. approval unblock) jump ahead of normal chat. Omit for normal/chat so
-  // c4-receive applies its default (3). See lib/system-message.js.
-  if (Number.isInteger(priority) && priority >= 1 && priority <= 3) {
-    args.push('--priority', String(priority));
-  }
-  args.push('--content', body);
-  return new Promise((resolve, reject) => {
-    execFile(
-      process.execPath,
-      [C4_RECEIVE, ...args],
-      { timeout: 30000 },
-      (err, stdout, stderr) => {
-        if (err) reject(new Error(stderr || err.message));
-        else resolve(stdout);
-      },
-    );
-  });
+/**
+ * The conversation's platform type, lower-cased: from its record, else the
+ * type stored for it in conv-org-map.json (types never change), else 'dm'
+ * (the long-standing default when neither is known).
+ */
+function convTypeOf(conv, conversationId) {
+  return (conv?.type || lookupConvRecord(conversationId)?.type || '').toLowerCase() || 'dm';
+}
+
+/**
+ * The session-group kind of a conversation (dm / group / sub): from its record
+ * when there is one, else from the type stored for it. null when neither says
+ * (or it is a type with no session group: STRAT, BROADCAST, BRIDGE).
+ */
+function conversationKindOf(conv, conversationId) {
+  return conv ? endpointKindOfRecord(conv) : endpointKindOf(lookupConvRecord(conversationId));
+}
+
+function forwardInbound(endpoint, body, priority, caps) {
+  return forwardToC4({ channel: CHANNEL, endpoint, content: body, priority, caps }, { log, warn });
 }
 
 // =============================================================================
@@ -630,7 +628,7 @@ async function shouldHandleMessage(msg, conv, orgConfig) {
     return { handle: true, reason: 'system-sender' };
   }
 
-  const convType = (conv?.type || '').toLowerCase() || (msg.thread_id ? 'thread' : 'dm');
+  const convType = convTypeOf(conv, msg.conversation_id);
   const access = orgConfig.access || {};
   const senderId = msg.sender_id;
   const senderName = msg.sender_display_name || msg.sender?.display_name || '';
@@ -695,7 +693,7 @@ async function shouldHandleMessage(msg, conv, orgConfig) {
     };
   }
 
-  // group / thread / group sub-conversation — compute mentioned/owner once up
+  // group / group sub-conversation — compute mentioned/owner once up
   // front so all gates and their userNotice decisions share the same view. A
   // sub-conversation is gated by its parent group's config (group-access.js).
   //
@@ -712,6 +710,10 @@ async function shouldHandleMessage(msg, conv, orgConfig) {
     sub: subConversationOf(conv),
     senderId,
     mentioned: isSelfMentioned({ mentionIds: mentions, selfMemberId }),
+    addressed: isSelfAddressed({
+      addressedIds: msg.addressed_member_ids || msg.message?.addressed_member_ids,
+      selfMemberId,
+    }),
     senderIsOwner: !!ownerMemberId && String(senderId) === String(ownerMemberId),
   });
 }
@@ -846,6 +848,29 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     const answeredCard = resolveReplyTarget(msg).cardMessageId;
     if (answeredCard) receiptWatch?.onReceipt(answeredCard);
 
+    // Multi-session Core (c4-receive takes --session-group, read once for this
+    // message): the conversation's kind names the session group, so it must be
+    // known before the message is acknowledged. The record is fetched with one
+    // retry; with no record and no stored type, the message is treated exactly
+    // like a TRANSIENT content-fetch failure above: the dedupe mark is released,
+    // the inbox seq is not recorded and the /sync cursor is not advanced, so a
+    // later catch-up fetches it again — never dropped in silence (an Agent or
+    // System Member sender gets no notice). Old Core: nothing here runs.
+    const caps = readInboundCaps();
+    if (caps.sessionGroup) {
+      const record = await fetchConversationRecord(() => fetchConversation(orgConfig.org_id, notifConv));
+      if (conversationKindPending(caps, record, lookupConvRecord(notifConv))) {
+        dedupe.forget?.(notifId);
+        const isSync = notification._via === 'sync';
+        warn(`[${orgConfig.slug}] msg=${notifId} conv=${notifConv}: conversation record unavailable and no stored type — not acknowledged, will re-pull` +
+          (isSync ? ' (sync-replay path, cursor not advanced)' : '; forcing WS reconnect to trigger /sync catch-up'));
+        if (!isSync) {
+          try { wsRef?.client?.forceReconnect('conversation-record-unavailable'); } catch {}
+        }
+        return { contentFetchFailed: true, transient: true };
+      }
+    }
+
     // Inbox-seq ledger: record the inbox_seq for continuous-ack tracking.
     // Sources (in priority order):
     //   1. Sync catch-up events: notification.seq IS the inbox seq (from /sync)
@@ -876,7 +901,6 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     if (!msg.sender_id   && msg.message?.sender_id)   msg.sender_id   = msg.message.sender_id;
     if (msg.seq == null  && msg.message?.seq != null) msg.seq         = msg.message.seq;
     if (!msg.type        && msg.message?.type)        msg.type        = msg.message.type;
-    if (!msg.thread_id   && msg.message?.thread_id)   msg.thread_id   = msg.message.thread_id;
     if (!msg.parent_message_id && msg.message?.parent_message_id) {
       msg.parent_message_id = msg.message.parent_message_id;
     }
@@ -893,7 +917,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     // BEFORE the policy filter, mirroring zylos-telegram's logAndRecord pattern
     // and zylos-lark's thread history. This ensures context is available even
     // for messages the bot doesn't handle.
-    const earlyConvType = (conv?.type || '').toLowerCase() || (msg.thread_id ? 'thread' : 'dm');
+    const earlyConvType = convTypeOf(conv, msg.conversation_id);
     if (fetchesConversationContext(earlyConvType, sub)) {
       const structured = (msg.content && typeof msg.content === 'object') ? msg.content : {};
       const entryText = structured.body?.text
@@ -993,7 +1017,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     }
 
     let recent = [];
-    const convType = (conv?.type || '').toLowerCase() || (msg.thread_id ? 'thread' : 'dm');
+    const convType = convTypeOf(conv, msg.conversation_id);
     if (fetchesConversationContext(convType, sub)) {
       const gathered = await gatherRecentContext({
         conversationId: msg.conversation_id,
@@ -1066,16 +1090,41 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     const replyConv = replyTarget.redirected
       ? await fetchConversation(orgConfig.org_id, replyConvId)
       : conv;
-    const replyConvType = (replyConv?.type || '').toLowerCase() || convType;
+    const replyConvType = (replyConv?.type || lookupConvRecord(replyConvId)?.type || '').toLowerCase() || convType;
     if (replyTarget.redirected) {
       // A redirect whose target cannot be fetched still routes correctly — only
-      // the framing degrades, and it degrades to the arrival conversation's type,
-      // which for a receipt is always the system DM. That is a wrong label, not a
-      // harmless one, so say so rather than logging a resolved-looking type.
+      // the framing degrades: to the type stored for the card's conversation,
+      // else to the arrival conversation's type, which for a receipt is always
+      // the system DM. That is a wrong label, not a harmless one, so say so
+      // rather than logging a resolved-looking type.
       if (replyConv) {
         log(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${msg.conversation_id} -> ${replyConvId} (${replyConvType})`);
       } else {
         warn(`receipt [${orgConfig.slug}] msg=${msg.id} reply target ${replyConvId} could not be fetched; framing falls back to ${replyConvType}`);
+      }
+    }
+    // Multi-session Core (`caps`, read once above): the endpoint names the reply
+    // conversation's kind, and the session group follows from it. A
+    // conversation whose kind is unknown (record, stored type and lookup all
+    // failed — only a redirected card's conversation can still be here) or has
+    // none (STRAT, …) is not forwarded — never guessed, never put in the
+    // overall group. On an older Core nothing here changes: no kind, the
+    // endpoint is as before.
+    let endpointType;
+    if (caps.sessionGroup) {
+      endpointType = conversationKindOf(replyConv, replyConvId);
+      if (!endpointType) {
+        warn(`no session group [${orgConfig.slug}] msg=${msg.id} conv=${replyConvId} type=${replyConv?.type || lookupConvRecord(replyConvId)?.type || 'unknown'}: not forwarding to C4`);
+        removeReaction(msg.id, 'no-session-group');
+        if (replyTarget.redirected) {
+          // The answer belongs on the card: say so there, as a reply to it.
+          if (replyTarget.cardMessageId) {
+            sendRejectNotice(orgConfig, { conversation_id: replyConvId, id: replyTarget.cardMessageId }, CARD_RETRY).catch(() => {});
+          }
+        } else if (shouldNoticeInboundFailure(msg, notification)) {
+          sendRejectNotice(orgConfig, msg, TRY_LATER).catch(() => {});
+        }
+        return;
       }
     }
     // The message this answer belongs to (OPENM-1337): the run's source and the
@@ -1085,14 +1134,8 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     const sourceMessageId = String(replyTarget.redirected ? (replyTarget.cardMessageId || msg.id) : msg.id);
     const endpoint = formatEndpoint({
       type: replyConvType,
+      endpointType,
       conversationId: replyConvId,
-      // Thread and parent belong to the conversation the message ARRIVED in. On
-      // a redirect they name a thread inside the read-only system DM, and the
-      // send path prefers a thread id over the conversation id — so carrying
-      // them would route the answer back to the place the redirect exists to
-      // avoid, while every log and the model's own framing said otherwise.
-      threadConversationId: replyTarget.redirected ? undefined : (msg.thread_id || undefined),
-      parentMessageId: (!replyTarget.redirected && msg.thread_id) ? msg.parent_message_id : undefined,
       sourceMessageId,
     });
     // smartHint mirrors zylos-feishu: only emitted when the group is in smart
@@ -1101,23 +1144,12 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
     const smartHint = decision.mode === 'smart' && !decision.mentioned;
     const groupName = decision.groupCfg?.name || replyConv?.name;
 
-    // Record the display name + member_id seen in this conversation (sender +
-    // group context) so an outbound `@name` can both be canonicalized to the
-    // exact name cws-fe matches on AND resolved to a real `mentions` entry
-    // (see src/lib/mention.js — cws-comm never derives mentions from text,
-    // only the sending client does). Best-effort; never blocks message handling.
-    recordParticipants(msg.conversation_id, [
-      { name: senderName, memberId: msg.sender_id },
-      ...recent.map((m) => ({ name: m.senderName, memberId: m.senderId })),
-    ]);
-
     // Quoted/reply: cws-comm marks a reply with parent_id (the WS notification
     // frame omits it, so it comes from the get-message detail merged into msg).
-    // Fetch the quoted message and surface it as <replying-to>. Threads take
-    // precedence (threadContext), so skip for threads.
+    // Fetch the quoted message and surface it as <replying-to>.
     let quotedContent;
     const quotedMsgId = msg.parent_id || msg.message?.parent_id || msg.parent_message_id;
-    if (quotedMsgId && convType !== 'thread') {
+    if (quotedMsgId) {
       const q = await fetchMessageDetail(orgConfig.org_id, msg.conversation_id, quotedMsgId);
       if (q) {
         const qStructured = (q.content && typeof q.content === 'object') ? q.content : {};
@@ -1202,7 +1234,7 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
       },
     );
 
-    // Agent activity: one run per DM, and per group / thread message that
+    // Agent activity: one run per DM, and per group message that
     // @-mentions this agent; the C4 body gets the [OM-RUN …] marker so the
     // collector can tie the runtime's steps back to it. Unregistered group
     // input (smart mode, not @-ed) is noted for send.js's guard. An
@@ -1223,18 +1255,35 @@ function makeOrgMessageHandler(orgConfig, sessionRef, inboxLedger, wsRef, receip
       activity.noteUnregisteredInput(endpoint, String(replyTarget.cardMessageId || msg.id));
     }
 
-    try {
-      registerConvOrg(msg.conversation_id, orgConfig.org_id);
-      if (replyConvId !== msg.conversation_id) registerConvOrg(replyConvId, orgConfig.org_id);
-      const c4Out = await forwardToC4(endpoint, run ? run.marker + body : body, inboundPriority(msg));
-      if (run) activity.confirmRun(run.runId, c4Out);
-      log(`fwd [${orgConfig.slug}] ${convType} ${msg.conversation_id} msg=${msg.id} seq=${msg.seq}`);
+    registerConvOrg(msg.conversation_id, orgConfig.org_id, convRecordFields(conv));
+    if (replyConvId !== msg.conversation_id) registerConvOrg(replyConvId, orgConfig.org_id, convRecordFields(replyConv));
+    const result = await forwardInbound(endpoint, run ? run.marker + body : body, inboundPriority(msg), caps);
+    if (result.outcome === 'sent' || result.outcome === 'stored') {
+      // Stored but reported as an error: Core has the message, so it is handled
+      // like a success (nothing shown, nothing resent).
+      if (run) activity.confirmRun(run.runId, result.stdout);
+      log(`fwd [${orgConfig.slug}] ${convType} ${msg.conversation_id} msg=${msg.id} seq=${msg.seq}${result.sessionGroup ? ` group=${result.sessionGroup}` : ''}${result.outcome === 'stored' ? ' (stored, reported failed)' : ''}`);
       markRead(orgConfig, msg.conversation_id, msg.seq);
-    } catch (e) {
-      if (run) activity.dropRun(run.runId);
-      warn('c4-receive failed:', e.message);
+      return;
+    }
+    if (run) activity.dropRun(run.runId);
+    removeReaction(msg.id, 'c4-failed');
+    warn(`c4-receive ${result.outcome} [${orgConfig.slug}] msg=${msg.id} conv=${msg.conversation_id}`);
+    if (result.notice && shouldNoticeInboundFailure(msg, notification)) {
+      sendRejectNotice(orgConfig, msg, result.notice).catch(() => {});
     }
   };
+}
+
+/**
+ * Whether to tell the sender their message could not be handed to the agent.
+ * The reject-notice exemptions: not on a sync replay (stale apologies after a
+ * fix), not to another agent (reject-notice ping-pong), not to a System Member
+ * (write-only platform identity).
+ */
+function shouldNoticeInboundFailure(msg, notification) {
+  const senderType = String(msg.sender_type || msg.message?.sender_type || '').toUpperCase();
+  return notification._via !== 'sync' && senderType !== 'AGENT' && !isSystemSender(msg);
 }
 
 // =============================================================================
@@ -1486,6 +1535,13 @@ async function handleSystemEvent(orgConfig, frame) {
     return;
   }
 
+  if (kind === 'channel' && isBrowserRemoteCommand(payload.data)) {
+    // OpenMax Browser prepare / revoke (cws-connect channel_type browser-remote).
+    browserRemote.handleCommand(orgConfig, frame).catch(e =>
+      warn(`[${orgConfig.slug}] browser-remote command: ${e.message}`));
+    return;
+  }
+
   if (kind === 'channel') {
     // Fire-and-forget, best-effort install/uninstall of an IM channel component
     // (cws-connect → cws-comm → openmax). handleChannelCommand never throws.
@@ -1519,7 +1575,7 @@ async function handleSystemEvent(orgConfig, frame) {
   // messages. Without this, edit/recall events from groups not in the
   // allowlist would bypass shouldHandleMessage and reach the agent.
   const conv = await fetchConversation(orgId, conversationId);
-  const convType = (conv?.type || '').toLowerCase() || 'dm';
+  const convType = convTypeOf(conv, conversationId);
   const syntheticMsg = {
     conversation_id: conversationId,
     sender_id: actorId,
@@ -1561,7 +1617,15 @@ async function handleSystemEvent(orgConfig, frame) {
   }
 
   const convName = conv?.name || conv?.display_name || '';
-  const endpoint = formatEndpoint({ type: convType, conversationId });
+  // Same rule as a message: on a multi-session Core the notice goes to the
+  // conversation's own session group, and is dropped when its kind is unknown.
+  const caps = readInboundCaps();
+  const endpointType = caps.sessionGroup ? conversationKindOf(conv, conversationId) : undefined;
+  if (caps.sessionGroup && !endpointType) {
+    warn(`[${orgConfig.slug}] system ${kind} notice dropped: no session group for conv=${conversationId} (type ${conv?.type || 'unknown'})`);
+    return;
+  }
+  const endpoint = formatEndpoint({ type: convType, endpointType, conversationId });
   const body = formatInboundForC4(
     { type: convType, id: conversationId, name: convName },
     { displayName: actorName, id: actorId },
@@ -1569,12 +1633,12 @@ async function handleSystemEvent(orgConfig, frame) {
     [],
     { orgId: orgConfig.org_id, orgName: orgConfig.org_name },
   );
-  try {
-    registerConvOrg(conversationId, orgConfig.org_id);
-    await forwardToC4(endpoint, body);
+  registerConvOrg(conversationId, orgConfig.org_id, convRecordFields(conv));
+  const result = await forwardInbound(endpoint, body, undefined, caps);
+  if (result.outcome === 'sent' || result.outcome === 'stored') {
     log(`[${orgConfig.slug}] system ${kind} notice -> agent conv=${conversationId} msg=${messageId}`);
-  } catch (e) {
-    warn(`[${orgConfig.slug}] system ${kind} notice failed: ${e.message}`);
+  } else {
+    warn(`[${orgConfig.slug}] system ${kind} notice failed (${result.outcome})`);
   }
 }
 
@@ -1668,8 +1732,10 @@ const postConnectResult = (r) => postForOrg(
 // Results the connector could not deliver even after its own retries. The
 // binding stays 'pending' until one lands, so the queue is on disk: a crash or
 // restart must not turn a connected channel into a permanent spinner.
+// The queue also carries undelivered OpenMax Browser prepare-results
+// (kind 'browser-prepare', stored without the Key; see browser-remote-connector).
 const connectResultQueue = createConnectResultQueue({
-  sendResult: postConnectResult,
+  sendResult: (r) => (r.kind === 'browser-prepare' ? browserRemote.resendPrepare(r) : postConnectResult(r)),
   log,
   warn,
 });
@@ -1690,6 +1756,22 @@ const handleChannelCommand = createChannelInstaller({
       { qr_png_base64: r.qrPngBase64, request_id: r.requestId || '' },
     );
   },
+  log,
+  warn,
+});
+
+const browserRemote = createBrowserRemoteConnector({
+  getForOrg,
+  postForOrg,
+  apiPath,
+  dedupe,
+  resolveRelayUrl: async (orgId) => {
+    const r = await resolveAgentBaseUrl({ getFn: (p) => getForOrg(orgId, p), apiPathFn: apiPath });
+    if (!r?.ok) throw new Error(r?.error || 'no public domain');
+    return relayUrlFromBase(r.base_url);
+  },
+  persistUndeliveredResult: async (r) => { connectResultQueue.queue(r); },
+  readQueued: () => connectResultQueue.read(),
   log,
   warn,
 });
@@ -2659,6 +2741,14 @@ tasks.register('ws-stall-watchdog', superviseWsStalls, WS_STALL_CHECK_INTERVAL_M
 // rather than waiting out the first interval.
 tasks.register('connect-result-resend', () => connectResultQueue.resend(),
   CONNECT_RESULT_RESEND_INTERVAL_MS, { runOnStart: true });
+// OpenMax Browser: revoke Workspace keys whose connection is no longer active.
+// Interval: config.browserRemote.reconcileIntervalMinutes (default 60).
+tasks.register('browser-key-reconcile', async () => {
+  const r = await browserRemote.reconcile([...activeOrgConfigs.values()]);
+  if (r.revoked.length) log(`browser key reconcile: revoked ${r.revoked.length}, kept ${r.kept}`);
+}, (Number(config.browserRemote?.reconcileIntervalMinutes) > 0
+  ? Number(config.browserRemote.reconcileIntervalMinutes) * 60 * 1000
+  : BROWSER_RECONCILE_INTERVAL_MS), { delay: 60 * 1000, runOnStart: true });
 tasks.register('frame-metrics', dumpFrameMetrics, WS_METRIC_INTERVAL_MS);
 tasks.register('owner-config-sync', periodicSync, PERIODIC_SYNC_INTERVAL_MS);
 // Holder for the readiness-edge trigger; started with the periodic tasks below.

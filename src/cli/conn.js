@@ -18,9 +18,13 @@ import { listCachedCredentials, clearCachedCredentials, readCredentialCache, sav
 import {
   readIndex, replaceIndexFromList, findConnectionByApp, findActiveConnectionsByApp, indexPathForOrg,
   readCatalog, writeCatalog, invalidateCatalog, CATALOG_TTL_MS,
+  readActionSchema, writeActionSchema,
   personalConnectorBlockedInConversation,
 } from '../lib/connect-store.js';
-import { acquireCredential } from '../lib/connection-events.js';
+import {
+  runProxyExecuteWithUploads, openLocalFile, putFileToPresignedUrl, uploadSlotPath,
+} from '../lib/composio-upload.js';
+import { acquireCredential, signRequestCall } from '../lib/connection-events.js';
 import { parseEndpoint } from '../lib/message.js';
 import { contextMetadata, fitsContextDataLimit } from '../lib/message-context.js';
 import { invokeDirect, resolveCredential } from '../lib/direct-exec.js';
@@ -689,6 +693,29 @@ async function getCatalog(orgId, applicationId, { refresh = false, ttlMs = CATAL
   }
   const rec = writeCatalog(applicationId, actions, { capabilities: CAPABILITIES_HEADER_VALUE });
   return { ...rec, source: 'fetch' };
+}
+
+// Proxy file-param detection: ONE action's input_schema via
+// conn.action_describe's endpoint, cached per (applicationId, action) with a TTL
+// (connect-store readActionSchema). Returns null when the applicationId is
+// unknown — the caller then skips file preprocessing. A describe failure is
+// remembered for ACTION_SCHEMA_FAILURE_TTL_MS (negative cache, so a failing
+// describe does not add a round trip to every call) and also returns null.
+async function getActionInputSchema(orgId, applicationId, action) {
+  if (!applicationId) return null;
+  const cached = readActionSchema(applicationId, action, { capabilities: CAPABILITIES_HEADER_VALUE });
+  if (cached) return cached.input_schema;
+  const { path } = planActionDescribe({ applicationId, action });
+  let info;
+  try {
+    info = await getForOrg(orgId, path, undefined, { extraHeaders: capabilityHeaders(), timeoutMs: 20000 });
+  } catch {
+    try { writeActionSchema(applicationId, action, null, { capabilities: CAPABILITIES_HEADER_VALUE, failed: true }); } catch { /* best effort */ }
+    return null;
+  }
+  const schema = info && typeof info === 'object' ? (info.input_schema ?? null) : null;
+  try { writeActionSchema(applicationId, action, schema, { capabilities: CAPABILITIES_HEADER_VALUE }); } catch { /* cache is best effort */ }
+  return schema;
 }
 
 // A connection is a proxy connector when its credential_mode is "proxy" — it
@@ -1445,7 +1472,7 @@ export function groupPersonalConnectorGuardEnabled(env = process.env) {
 // `parent_id` (cws-comm Conversation.parent_id ← parent_conversation_id); we
 // resolve it ONE hop to the parent's type so a thread inside a DM is not
 // mistaken for a group. The caller may also pass a reply-via endpoint string
-// (`<conv>|thread:…|parent:…`) — only its leading conversation id (where the
+// (`<conv>|type:…|msg:…`) — only its leading conversation id (where the
 // message arrived) is used.
 //
 // Returns the lower-cased effective type ('dm', 'group', …) or null when it
@@ -1458,7 +1485,7 @@ export async function resolveGuardConversationType(rawConversationId, fetchConve
   try { convId = parseEndpoint(rawConversationId).conversationId; } catch { return null; }
   if (!CONV_ID_RE.test(convId)) return null;
   const typeOf = (c) => (typeof c?.type === 'string' ? c.type.trim().toLowerCase() : '');
-  const isThread = (t) => t === 'strat' || t === 'thread';
+  const isThread = (t) => t === 'strat';
   let conv;
   try { conv = await fetchConversation(convId); } catch { return null; }
   let type = typeOf(conv);
@@ -1541,7 +1568,7 @@ export const COMMANDS = {
     if (!connId) throw Object.assign(new Error('connectionId is required'), { status: 400 });
     const orgId = requireOrgId();
     if (!resolveSelfMemberId(orgId)) throw Object.assign(new Error('cannot resolve agent member_id'), { status: 400 });
-    return postForOrg(orgId, apiPath(`/connect/connections/${connId}/credential`));
+    return acquireCredential(orgId, connId);
   },
 
   // conn.proxy — REMOVED. The old free-form client-driven proxy verb is gone;
@@ -1893,10 +1920,24 @@ export const COMMANDS = {
       // or getCatalog on this path. Result is the server passthrough
       // { status_code, body } (analogous to the direct path's { status_code,
       // headers, body }, minus locally-observed response headers).
-      return await postForOrg(
-        orgId,
-        apiPath(`/connect/connections/${entry.id}/actions/execute`),
+      //
+      // Local-file params: a file_uploadable param
+      // whose value is a LOCAL PATH is uploaded first (upload-slot + streamed
+      // PUT to the presigned URL) and replaced by {upload_id}; URLs / objects
+      // pass through. No applicationId / describe failure → executed as before.
+      return await runProxyExecuteWithUploads(
         { action: params.action, params: params.params || {} },
+        {
+          getSchema: () => getActionInputSchema(orgId, entry.applicationId, params.action),
+          open: (p, opts) => openLocalFile(p, opts),
+          requestSlot: (body) => postForOrg(orgId, apiPath(uploadSlotPath(entry.id)), body),
+          putFile: (url, opts) => putFileToPresignedUrl(url, opts),
+          execute: (execParams) => postForOrg(
+            orgId,
+            apiPath(`/connect/connections/${entry.id}/actions/execute`),
+            { action: params.action, params: execParams },
+          ),
+        },
       );
     }
 
@@ -1926,6 +1967,8 @@ export const COMMANDS = {
             {
               acquire: (oid, connId) => acquireCredential(oid, connId),
               saveCache: (connId, fresh) => saveCredentialCache(connId, fresh, entry.slug),
+              // Only used for a connection whose credential carries request_signing.
+              signRequest: (oid, connId, req) => signRequestCall(oid, connId, req),
             },
           );
         } catch (err) {
@@ -2016,6 +2059,9 @@ Capability cache (runtime/connect/)
                                                                  #   >1 connections for an app → returns needs_selection (ask
                                                                  #   the user by candidate label; map the choice back to its
                                                                  #   connection_id, retry with connectionId)
+                                                                 #   proxy (Composio) file params: absolute path of a file in
+                                                                 #   ~/zylos/components/openmax/{upload,media}/ (uploaded by the CLI,
+                                                                 #   ≤500MB) or a public https URL; long-running call
   conn.catalog        {app|applicationId, refresh?}             # cached action catalog (fills from conn.app_actions on miss/TTL)
   conn.index          {refresh?}                                # show the local connections index (connection → application)
 
@@ -2047,6 +2093,7 @@ async function main() {
     const payload = { error: err.message };
     if (err.status) payload.status = err.status;
     if (err.code) payload.code = err.code;
+    if (err.sent === false) payload.sent = false; // request signing: refused before anything reached the provider
     const fieldErrors = err.body?.error?.errors;
     if (Array.isArray(fieldErrors) && fieldErrors.length > 0) payload.errors = fieldErrors;
     console.error(JSON.stringify(payload));

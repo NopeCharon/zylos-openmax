@@ -86,14 +86,17 @@ a plain Chinese `fallback_text` for clients that don't render the card.
 
 ### conn.acquire
 Acquire the credential for a connection. Returns `access_token`, `token_type`,
-`expires_at`, `toolkits[]` — the token is cached locally and injected for you on
-`conn.invoke`, so you normally never call this directly.
+`expires_at`, `toolkits[]`. It does **not** write the local credential cache:
+`conn.invoke` acquires, caches and injects the token itself, so you normally
+never call this (it also puts the token into your context). To make
+`conn.invoke` use a fresh credential, run `conn.clear_cache {connectionId}` and
+invoke again.
 
 ```bash
 node src/cli/conn.js conn.acquire '{"connectionId":"2b0e4f41-..."}'
 ```
 
-The comm-bridge automatically acquires and caches credentials on `connection.authorized` events. Use this command to manually acquire or refresh.
+The comm-bridge automatically acquires and caches credentials on `connection.authorized` events. Use this command only to inspect what the server returns.
 
 ### conn.actions
 Discover the named actions available for a connection's provider. Pair with `conn.invoke` to run one by name. Scoped to the agent's authorization on the connection.
@@ -753,6 +756,41 @@ in the local catalog and the URL can only be that action's `url_template` expand
 with schema-checked params. A free-form provider URL is never accepted from the
 caller.
 
+### Connections that require request signing
+
+Some direct connectors (e.g. TikTok Shop) need every request signed with an app
+secret that stays on the platform. You call `conn.invoke` exactly as usual; the
+plugin has each request signed by the platform before sending it (one extra
+round trip). Nothing changes in the params you pass. Errors to act on (in all of
+them except `signed_request_redirected` nothing was sent; the CLI error carries
+`code`, `status` and, where the plugin knows nothing reached the provider,
+`sent: false`):
+
+| `code` | status | What to do |
+|---|---|---|
+| `CONNECT_SHOP_NOT_AUTHORIZED` | 400 | The `shop_cipher` you passed is not a shop of this connection. Call the connector's `get_authorized_shops` action and pass one of its `cipher` values (a connection with several shops needs `shop_cipher` on shop actions; with one shop it is filled in for you). If the shop is missing, the user must re-authorize. |
+| `CONNECT_REQUEST_NOT_IN_CATALOG` | 400 | The request did not match the action (method, host, path, query params). Refresh the catalog (`conn.catalog {refresh:true}`), check the action with `conn.action_describe`, pass only declared params (no `_query` extras). |
+| `CONNECT_BODY_TOO_LARGE` | 400 | The body is over the signing limit; send less per call. |
+| `CONNECT_CLIENT_UPGRADE_REQUIRED` | 426 | The plugin is too old for this connection — the plugin must be upgraded. |
+| `CONNECT_SIGNING_NOT_ENABLED` | 422 | The local credential disagrees with the server: `conn.clear_cache` for that connection and retry once; report if it persists. |
+| `request_signing_unsupported_path` | 422 | `_download`, `request_spec` actions and the Meta page-token exchange are not supported on these connections yet. |
+| `request_signing_unsupported_auth` | 422 | The connection places its credential in the URL query, which cannot be combined with signing. Report it; do not retry. |
+| `request_signing_unsupported` | 501 | The server does not support signing yet (usually the platform is not upgraded yet). Tell the user; do not retry. |
+| `request_signing_expired` | 502 | The server returned an already-expired signature twice. This host's clock may be wrong; report it. |
+| `request_signing_invalid_response` | 502 | The server's signing answer was malformed. Report it; do not retry in a loop. |
+| `signed_request_redirected` | 502 | The request **was delivered** and the provider answered with a redirect (not followed for signed requests). Do **not** retry a write action — it may already have taken effect; check its result first. Report it. |
+
+**Provider "token expired" inside a 2xx** (e.g. TikTok Shop `code: 105002` in
+an HTTP 200 body): the plugin does not re-acquire on these. Run
+`conn.clear_cache {"connectionId":"<id>"}` and retry the same `conn.invoke`
+once — the invoke then fetches and caches a fresh credential. Do **not** use
+`conn.acquire` for this: it does not update the cache (the retry would reuse
+the old token) and it puts the token into your context. Report if it fails
+again.
+
+Signed URLs, signatures and request bodies never appear in the logs (only
+method, host, path and the provider's status code).
+
 ## Capability Cache & Call Chain (runtime/connect/)
 
 All connect-side local state lives under one subtree, split by its natural key:
@@ -761,6 +799,7 @@ All connect-side local state lives under one subtree, split by its natural key:
 runtime/connect/
 ├── connections-index.<orgId>.json   # connection → application, per org
 ├── action-catalog/<applicationId>.json   # application → capability
+├── action-schema/<applicationId>__<action>.json   # ONE proxy action's input_schema (file params), 6h TTL; failed describe 5 min
 └── credentials/<connectionId>.json  # real access_token, 0600
 ```
 
@@ -794,7 +833,8 @@ it does not need to "know" the sequence:
    - **`proxy` / composio** — POST the action to the platform's server-side
      execute endpoint (`POST /connect/connections/{id}/actions/execute`); no local
      token or catalog is touched. Returns the server passthrough `{ status_code,
-     body }`. A legacy index entry with no recorded `credential_mode` triggers one
+     body }`. A local file path in a `file_uploadable` param is uploaded first —
+     see "File parameters on proxy (Composio) actions" below. A legacy index entry with no recorded `credential_mode` triggers one
      `conn.list` refresh (which now returns it) before routing.
 2. **`conn.catalog {app|applicationId}`** — returns the cached action catalog for
    discovery, filling from `conn.app_actions` on a miss / TTL-expiry (24h) /
@@ -871,6 +911,99 @@ complement (e.g. a raw-MIME `…/messages-send`) keep working unchanged.
   plugin upgrade the cache is refetched at once instead of waiting for the 24h TTL.
 - Audit logs for these actions show only parameter names with type and size
   (`text:<string 1.2KB> attachments:<2 files 3.4MB>`), never values.
+
+### File parameters on proxy (Composio) actions
+
+A Composio action marks each file param with `file_uploadable: true` in its
+`input_schema` (e.g. `YOUTUBE_UPLOAD_VIDEO.videoFilePath`, mail attachments,
+Drive uploads). For such a param, pass one of:
+
+| Value | What happens |
+|-------|--------------|
+| **A local file path** (recommended) — absolute or `~/…`, of a file in `~/zylos/components/openmax/upload/` or `~/zylos/components/openmax/media/` | `conn.invoke` uploads the file, then executes with `{"upload_id": "…"}` in its place |
+| A public **direct** `https://` URL (no redirects; max 100MB) | sent as-is; the server downloads it |
+| An object you already have (`{"upload_id": …}`, `{name, mimetype, content_base64}`) | sent as-is |
+
+Which strings are local paths: one starting with `~/` always is; one starting
+with `/` is, **unless** it looks like raw base64 (it starts with `/9j/` — a
+JPEG's base64 — or is 64+ characters of only `A–Z a–z 0–9 + /` with optional
+trailing `=`). Any other string (URL, `data:` URI, base64 text, a bare file
+name) is sent unchanged.
+
+The server itself accepts only three forms for a file param: a public
+`http(s)` URL, `{"upload_id": …}`, or `{name, mimetype, content_base64}`.
+Anything else — other object shapes (`{name, path}`, …) or a path the CLI did
+not upload — is rejected with `unsupported file input`. So a local file must be
+passed as a path the CLI uploads, i.e. one in `~/zylos/components/openmax/upload/`
+or `media/`.
+
+**The file must be in the openmax component's `upload/` (or `media/`)
+directory** — the same rule as the direct-connection file sources above. Copy
+any other file there first with `cp` (not a symlink or hard link):
+
+```bash
+cp ~/zylos/workspace/out/demo.mp4 ~/zylos/components/openmax/upload/demo.mp4
+node src/cli/conn.js conn.invoke '{"app":"youtube","action":"YOUTUBE_UPLOAD_VIDEO","params":{"videoFilePath":"~/zylos/components/openmax/upload/demo.mp4","title":"Demo","privacyStatus":"unlisted"}}'
+```
+
+What `conn.invoke` does for a local path (proxy connections only):
+
+1. Reads the action's `input_schema` (`conn.action_describe`'s endpoint) and
+   finds every `file_uploadable` param exactly the way the server does —
+   `properties`, single-schema `items`, `anyOf`/`oneOf` (first branch with a
+   file value), `allOf` and `$ref` (to `$defs`/`definitions`). Any non-null
+   file value except a bare `{s3key}` descriptor counts, not just local paths:
+   if a URL / base64 / `upload_id` file value already settles an `anyOf`
+   branch or an `allOf`, a local path the server would then skip is not
+   uploaded either. A file param under
+   `additionalProperties`, `prefixItems` or tuple-form `items: […]` is not
+   uploaded (the server would not convert it), and a `file_uploadable` param
+   takes one file, not an array of paths. The schema is cached per action
+   for 6h under `runtime/connect/action-schema/`; a failed describe is
+   remembered for 5 minutes. **So a proxy call whose params contain a string
+   starting with `/` or `~/` costs at most one extra describe per action per
+   TTL**; calls without such a string never describe. If the schema cannot be
+   read (no applicationId yet, describe failed), the call runs exactly as before
+   without preprocessing.
+2. Checks the path with the direct-branch sandbox: real path (symlinks
+   resolved) inside `upload/` or `media/`; dot-file segments, `.env*`, `*.pem`,
+   `*.key`, `id_*`, the component `runtime/` and `config.json`, `~/.ssh`,
+   `~/.config` refused. Then it opens the file **once** and works only on that
+   descriptor: regular file, the same file that was checked (its `/proc/self/fd` path must equal the checked real path and pass the sandbox again; inode compared everywhere), not a hard link, not empty, **at most 500MB**
+   (override: `OPENMAX_CONN_UPLOAD_MAX_BYTES`); md5 and the upload both read
+   exactly the size seen at open (a file that grows meanwhile is cut at that
+   size; one that shrinks fails with `file_changed`). Mimetype from the
+   extension (`application/octet-stream` when unknown).
+3. `POST /connect/connections/{id}/files/upload-slot` `{action, filename,
+   mimetype, size, md5}` → `{upload_id, presigned_url, expires_at}`.
+4. Streams the file to `presigned_url` with a plain `PUT` (Content-Type +
+   Content-Length only; no platform credentials; skipped when the server returns
+   an empty `presigned_url`). The URL is never logged or printed. Timeout: 10
+   minutes, longer for big files.
+5. Replaces the param with `{"upload_id": "…"}` and executes.
+
+Errors (exit 1, JSON on stderr):
+
+| `code` | status | Meaning / what to do |
+|--------|--------|----------------------|
+| `file_not_found` | 400 | No such file — check the path. |
+| `file_invalid_path` | 400 | Not an absolute / `~/` path. |
+| `file_outside_allowed_dirs` | 403 | Copy the file into `~/zylos/components/openmax/upload/` first, then pass that path. |
+| `file_forbidden` | 403 | Protected file (keys / `.env` / dot-files / runtime / hard link) — never upload these; pick or copy another file. |
+| `file_not_regular` / `file_empty` | 400 | A directory/device, or a 0-byte file — pass a real file with content. |
+| `file_too_large` | 400 | Over 500MB — use a smaller file or a public https URL. |
+| `file_changed` | 409 | The file was replaced or shrank while being read — stop whatever changes it, then retry. |
+| `local_file_upload_unsupported` | 400 | This environment's server has no upload endpoint yet — pass a public direct https URL instead. |
+| `CONNECT_CONNECTION_NOT_FOUND` (or another server code) | 404 | The upload-slot call itself was refused — handle like the same error from execute. |
+| `CONNECT_FILE_UPLOAD_SLOT_UNAVAILABLE` | 503 | Upload temporarily unavailable on the server — retry later (not in a tight loop), or pass a public https URL. |
+| `CONNECT_FILE_UPLOAD_RATE_LIMITED` | 429 | Too many uploads for this connection / org — back off before trying again; do not retry in parallel. |
+| `upload_put_failed` / `upload_put_timeout` | 502 / 504 | Upload to storage failed — retry the call **once**; if it fails again, use an https URL. |
+
+**This is a long-running call** (upload + the provider's own processing, e.g.
+YouTube): run it without a short timeout and never retry it in parallel —
+a cancelled or doubled call can publish twice. Limits of the target platform
+(e.g. Gmail's 25MB attachments) still apply and come back from execute as the
+provider's error.
 
 ### Multiple connections for one app (disambiguation)
 
@@ -984,8 +1117,11 @@ agent's **local cleanup is identical** (unindex + delete the cached credential).
 | Method | Path | CLI |
 |--------|------|-----|
 | GET | `/connect/agents/me/connections` | conn.list / conn.index --refresh |
-| POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh) |
+| POST | `/connect/connections/{id}/credential` | conn.acquire (also the token refresh); sends `X-Connect-Client-Capabilities` including `request_signing.v1` |
 | POST | `/connect/connections/{id}/actions/execute` | conn.invoke (proxy/composio server-side execute) |
+| POST | `/connect/connections/{id}/sign` | conn.invoke (direct: sign one request of a connection whose credential carries `request_signing`) |
+| POST | `/connect/connections/{id}/files/upload-slot` | conn.invoke (proxy: upload slot for a local-path file param) |
+| GET | `/connect/applications/{id}/actions/{action}` | conn.invoke (proxy: the action's `input_schema` for file params, cached 6h / failure 5 min) |
 | GET | `/conversations/{id}` | conn.invoke (personal-connector group guard: conversation type — guard currently off, not called) |
 | GET | `/connect/connections/{id}` | conn.status |
 | GET | `/connect/connections/{id}/actions` | conn.actions (optional `?cursor=&limit=`) |
