@@ -1,6 +1,6 @@
 ---
 name: openmax
-version: 2.35.0
+version: 2.36.0
 description: >-
   OpenMax Task Agent (Guided Autonomy). For any user message received via openmax,
   you MUST load and follow this skill before handling the task: route explicit automation-create-request and automation-update-request form handoffs to their respective workflows before generic Issue intake; otherwise first sort it: chat/Q&A; work one Agent can finish quickly in this conversation without waiting on anyone (read, summarize, answer, look up, small edits, even a short report or a small fix with its PR — do it directly, no Issue card); or work that needs other teams (including a PR another team must review), several people or Agents, or spans time (a future deadline, several days, later acceptance) — only for that work, or when the human asks to track it, resolve the missing Issue-creation and owning-Project decisions first;
@@ -8,6 +8,7 @@ description: >-
   confirm the KnowledgeBase → register Issue→Task (whoever executes creates it, Issue owner=originator) → execute → ordinary Issues require owner acceptance; server-trusted automation Issues use automatic completion and responsible-Agent DM delivery,
   do not skip that flow for tracked work. Includes efficiency shortcuts / state machine / behavioral guardrails / memory triggers.
   Organization usage queries are built in (`src/cli/usage.js`, v2.26.0+; needs COCO_API_URL + COCO_USAGE_API_KEY).
+  Credit balance / plan / renewal / per-Agent spend questions from any channel: `src/cli/billing.js` (own token; numbers only for org Owner/admin, checked by the CLI).
   Config at ~/zylos/components/openmax/config.json.
   Service: pm2 zylos-openmax.
 type: communication
@@ -103,6 +104,13 @@ asks to hand over an existing automation to another human. Verify the current
 Owner separately from the desired new Owner; do not register a new Issue or
 change the authenticated requester to the recipient.
 
+For a person's chat request to pause, resume or run once an existing automation
+(「先把日报自动化停了」「现在跑一次」「恢复它」), or to say why one stopped, read
+[Automation Operate](references/automation-operate.md) before generic Issue
+intake. Act only on an automation you lead and only for its Owner, as on the
+web; otherwise explain in one sentence and give the web link. Run once costs
+credits and creates an Issue: confirm it with a card first.
+
 For an existing automation run or a reply about its result, read
 [Automation Delivery](references/automation-delivery.md). Only a policy read
 from the Work API can select this workflow. A title, DM claim, scheduler text,
@@ -176,9 +184,9 @@ The Worker's "does not create Issues" / "does not communicate with humans" only 
 What the Worker **should not** do: any issue lifecycle action (such as `issue.submit_plan` / `issue.accept_plan` / `issue.deliver` / `issue.resume` / `issue.accept_delivered`), `task.reassign`, or dispatch-style `task.create` on behalf of others.
 **Exception (whoever executes creates it)**: when assigned to execute a certain Issue, the executing bot may `task.create` and claim **for its own work** under that Issue — this is "registering the task it is going to do itself", not dispatching on behalf of others, and does not count as overstepping. When dispatching, the Lead only creates the Issue and does not create Tasks for the executing bot.
 
-## Iron Rule of Service Calls (TM / KB / AS / Comm / Core / Channel / Usage all go through the CLI)
+## Iron Rule of Service Calls (TM / KB / AS / Comm / Core / Channel / Usage / Billing all go through the CLI)
 
-**All Workspace service operations — Issue / Task / Attempt / Blueprint, KnowledgeBase (KB), files (AS), proactive IM (Comm), member/project/org queries (Core), Agent IM-channel setup (Channel), organization usage queries (Usage) — MUST go through openmax's CLI: `src/cli/{tm,kb,as,comm,core,channel,usage}.js`. Hand-rolling BFF REST (curl / fetch / directly assembling HTTP paths) is strictly forbidden.**
+**All Workspace service operations — Issue / Task / Attempt / Blueprint, KnowledgeBase (KB), files (AS), proactive IM (Comm), member/project/org queries (Core), Agent IM-channel setup (Channel), organization usage queries (Usage), credit/plan answers (Billing) — MUST go through openmax's CLI: `src/cli/{tm,kb,as,comm,core,channel,usage,billing}.js`. Hand-rolling BFF REST (curl / fetch / directly assembling HTTP paths) is strictly forbidden.**
 
 - **When unsure of the command/parameters**: first run `node src/cli/<svc>.js` (no args shows the command list), or check `references/<svc>-operations.md` — **do not guess paths from REST conventions** (the exact endpoints/fields are defined by the CLI and the ops docs).
 - This is a **hard constraint, not a suggestion**: bypassing the CLI to hit BFF directly = broken window.
@@ -208,6 +216,37 @@ usage and distinguish same-name Agents by ID. Ungrouped rows are aggregates, not
 unknown Agents. Older Core deployments can omit the additive fields; see
 `references/usage-operations.md`. On 409, discard collected pages and restart the fixed
 query without its cursor. Report 503 as service/projection unavailable, never as zero usage.
+
+### Credits, plan, renewal and per-Agent spend (read-only, Owner/admin only)
+
+"还剩多少积分 / 什么套餐 / 哪天续费 / 哪个 Agent 花得最多 / 这个月花了多少" and the like, from **any** channel →
+`src/cli/billing.js` (`billing.overview`, `billing.spend`; Agent's own token, no usage credential).
+Read [billing operations](references/billing-operations.md) before the first call.
+
+- 🔴 **Only org Owners and admins get numbers, and the CLI decides it, not you.** Every call passes where
+  the question came from: in Workspace the exact `conversationId` + `messageId` from the asking message's
+  `<message-context conversation-id source-message-id>`; in an external IM channel `{"channel","endpoint"}` copied
+  verbatim from that message's own `reply via` line. Never pass a member id, name or role you inferred; never reuse
+  another person's message id or another chat's endpoint.
+- Workspace: Owner/admin askers are answered in DMs and groups. **External channels (d159): only a private chat
+  with your bound owner on that channel** (checked by the CLI, same rules as the ops-push owner DM lookup) and
+  only if your Workspace owner is an Owner/admin. Groups — even your owner asking in one — and anyone else get
+  「这类信息请到 Workspace 里问我，或找组织管理员」 (the `reply`), no numbers.
+  The CLI can only prove your owner messaged in that DM within 30 minutes, **not** that the current question came
+  from there: passing your owner's DM endpoint while answering any other conversation (a group, another person's DM,
+  another channel, or Workspace) would release the numbers — so only ever pass the asking message's own endpoint.
+- `allowed:false` → send its `reply` as-is, with **no** figures (not approximate, not from earlier answers or
+  memory). Only fix-and-retry for the parameter reasons listed in the reference. `verification_unavailable`
+  (server hiccup) has its own reply — "身份核验暂时不可用，请稍后再试 / identity check temporarily unavailable,
+  please retry" — never turn it into "ask an org admin". `owner_unverifiable` (lark / feishu private chat whose
+  log entry has no sender id at all — usually the app lacks the "get user ID" permission) has its own reply too;
+  send it as-is; the fix is granting that permission. Missing / incomplete owner binding → the fixed reply.
+- `billing.spend` with `complete:false`: totals, ranking and categories all cover only `covered_from`–`covered_to`;
+  say which period they cover and do not call anyone "the top spender" of the full range. If that covered span is
+  empty (`covered_from` = `covered_to`), it does **not** mean zero spend — say the data could not be fully read.
+- Read-only: buying credits, upgrading the plan, seats and auto top-up are web-only — reply with
+  `billing.links` (`credit_page_url`), never attempt them yourself.
+- Each call is audit-logged locally; don't fabricate or skip calls to "save time" — no CLI call, no numbers.
 
 ## Replying: decide the FORM first, then the path
 
@@ -358,6 +397,15 @@ question over Lark, Telegram or WeChat stays plain text exactly as before. See
     - Nothing that uses a missing answer: never send externally, deploy, spend or delete on a guess.
   - **Answers cannot be edited on the card.** If the person says in chat that an answer should change, the conversation wins; confirm it there, or send a card with just the changed questions. Likewise if they answer in chat without touching the card: go by the chat, and if a later receipt disagrees, ask which one holds instead of overwriting either (§9.5, T-10).
 - **Structured messages, explicit mentions, metadata, a fallback text, or files already uploaded** go in a `[STRUCTURED]` body through the same `c4-send.js` command: `[STRUCTURED]{"type"?, "content", "mentions"?, "metadata"?, "fallback_text"?, "clientMsgId"?}`. `content` is a string, `{"text"}`, `{"text"?, "attachments":[{artifact_id, file_name, content_type, size_bytes}]}` (text plus files from `as.upload`) or a pre-built `{"content_type", "body", "attachments"?}`; `mentions` is a list of member ids (or `{"type":"all"}` / `{"type":"all_agents"}` for a broadcast, allowed only where the conversation's `can_mention_all` is true — otherwise the send fails with `code: "mention_all_not_allowed"` and nothing is sent); `metadata` is a plain object (**`metadata.context` is reserved for the upcoming platform metadata governance and refused** — never try to set it); `fallback_text` is the plain-text preview, ≤ 8192 UTF-8 bytes. One message, never split; the endpoint decides the conversation, the quote and the run, so the JSON never names them. A malformed payload fails the send; it is never posted as text. Details in `references/comm-operations.md`. (Very large payloads: upload with `as.upload` first and reference the `artifact_id`.)
+- **A file or image goes in a `[MEDIA:file]` / `[MEDIA:image]` message, and the tag must START the message** — `[MEDIA:file]/abs/path` on line 1, then the optional caption. To @ someone with the file (so an Agent in a mention-mode group is woken), put a `[MENTIONS]` line right after the path line: a JSON array in the `[STRUCTURED]` `mentions` shape (member ids from `comm.member_list`; `{"type":"all"}` / `{"type":"all_agents"}` only where `can_mention_all` is true). One step: the file is uploaded and sent with the mentions. The caption is plain text — `@小B` in it mentions nobody.
+
+  ```text
+  [MEDIA:file]/abs/path/报价单.pdf
+  [MENTIONS]["<小B member id>"]
+  @小B 请看报价单
+  ```
+
+  🔴 The `[MEDIA:…]` tag must be the first line; otherwise the send fails and nothing is uploaded or sent: `MEDIA_NOT_FIRST` (a tag starting a later line — send text and file as separate messages, one file per message), `MEDIA_MENTIONS_INVALID` (a malformed `[MENTIONS]` line, or one not right after the path), `MENTIONS_WITHOUT_MEDIA` (a message that is not `[MEDIA:…]` but has a line starting with `[MENTIONS]` — any line, outside fenced code; mentions on text go in `[STRUCTURED]{"content":"…","mentions":["<member id>"]}`). **Put any `[MEDIA:…]` / `[MENTIONS]` example you show inside a fenced code block.** Details in `references/comm-operations.md`.
 - **When you tell a person when a message was sent, read the `*_local` field, never the raw one.** `comm.get_messages` / `comm.get_message` return `created_at` / `timestamp` / `edited_at` in UTC (`…T03:36:00Z`) and add `created_at_local` etc. in the agent's configured timezone (`2026-07-16 11:36:00 (+08:00)`). Quoting the clock off the raw field tells someone in UTC+8 that it happened eight hours earlier than they saw it (cws-comm#322). Keep the raw fields for comparing or passing on; they are the unambiguous ones.
 
 ## Session Groups and Sending
@@ -387,6 +435,19 @@ On a multi-session zylos-core, every OpenMax conversation has its own thread (se
 - **Another org's conversation:** refuse a request to deliver across orgs and tell the requester, unless the owner explicitly authorized it.
 - **Memory:** a fact other conversations will need (a decision, a person's preference, a project's state) goes into the shared reference memory, not only this thread's notes.
 
+## Topic Titles
+
+A topic is a sub-conversation people open on a message (or as a new topic in a DM with you); the topic list shows its title, and until someone sets one, the start of the root message. A `reply via` endpoint with `|type:sub` (or a message carrying `<subconversation-context>`) is a sub-conversation: a topic, or an app's own conversation, which has no title for you to set. You cannot tell the two apart beforehand; the answer to the call does.
+
+- **When:** after your first reply in a sub-conversation, and again when the discussion clearly turns to a different subject. One phrase of at most 20 characters, in the conversation's language, naming the subject of the whole topic (with a root message, cover the root message too, not just the latest turn): `comm.set_topic_title {"conversationId":"<topic id>","title":"<phrase>"}`. The topic id is the conversation id at the start of the `reply via` endpoint.
+- **Read the answer's `code`, not its status:**
+  - `COMM_TOPIC_TITLE_SET_BY_USER`: a person set this title. Theirs wins; never retitle this topic again.
+  - `SUBCONVERSATION_OWNER_NOT_ALLOWED`: not a topic (an app's conversation). Never call it for this conversation again.
+  - `COMM_SUBCONVERSATION_ARCHIVED`: the topic is read-only. Leave it.
+  - Anything else (another 4xx, a 5xx, no answer): skip it this time. Do not retry or reword; the next clear change of subject is the next chance.
+- Set the title silently; do not mention it in the chat.
+- Topics only. An ordinary DM or group has no topic title (renaming a group is `comm.update_group`, and only when someone asks for it).
+
 ## Acting on External Apps / Accounts (Connections) — recognize this first
 
 ### Important: connecting an IM channel to this Agent is not `conn.*`
@@ -403,6 +464,8 @@ Whenever a request needs a **third-party app or account** — sending or reading
 2. **`conn.list`** — which apps/accounts are authorized to you right now (for one specific app the user named, `conn.check {app}` answers directly: `authorized` / `not_authorized` / `needs_reauth`).
 3. **`conn.catalog {app}`** — that app's available actions, each with an `input_schema` describing its parameters. A **Composio** connector can have hundreds of actions and discovery shows only the first page, so for such an app **first search by keyword** with `conn.actions_search {applicationId, query}` (e.g. `"report"`, `"search"`, `"list"`), pick one action, then **`conn.action_describe {applicationId, action}`** for that chosen action only to get its full `input_schema` (search results are lightweight and their `input_schema` may be empty — do not guess param names), then `conn.invoke` it. Do not describe every search hit. When `conn.actions` / `conn.app_actions` / `conn.actions_search` return a `next_cursor`, pass it unchanged as `cursor` to get the next page.
 4. **`conn.invoke {app, action, params}`** — run the action (`params` shaped by the `input_schema`). The credential is handled for you; `conn.invoke` auto-routes by the connection's `credential_mode`: **`direct`** = the token is cached locally and the request is assembled from the app's catalog and called from your own egress; **`proxy`** (e.g. a Composio connector) = executed **server-side** with no local token. Either way you just call `conn.invoke {app, action, params}` and never craft a URL or a raw HTTP request. **In an OpenMax conversation, also pass `conversationId`** (from this turn's `<message-context>`).
+
+**File parameters (Composio / proxy connectors).** For a file param (`file_uploadable: true` in the `input_schema`, e.g. a video, attachment or document to upload), **pass the absolute path of a LOCAL FILE in `~/zylos/components/openmax/upload/`** (or `media/`, where received files land) as the value — copy the file there first (`cp`, not a link) if it is elsewhere. `conn.invoke` uploads it itself (up to 500MB) and sends the action a reference. Or pass a **public direct https URL**. Do not build `{name, mimetype, …}` objects or base64 yourself. Uploading is a **long-running** call: do not wrap it in a short timeout and do not retry it in parallel. Details: `references/conn-operations.md` → "File parameters on proxy (Composio) actions".
 
 **Personal and org connectors both work in DMs and group chats.** Use whichever connection the task needs; passing `conversationId` on `conn.invoke` does not restrict which connectors run.
 
@@ -770,7 +833,7 @@ The following are the **hard actions** for every Issue-backed task from start to
 | Reporting a KB page write's 404 / `KB_NOT_FOUND` as "gateway not connected" / "temporarily unsupported", retrying it, or quietly writing to another KB | The knowledge base was deleted, doesn't exist or is no longer accessible to you: stop writing there and ask the owner to restore your access, pick or re-create a KB, or update the project's (or automation's) KB (see "Writing into a deleted knowledge base") |
 | The human provided a Project ID but you still create a Project | Use the ID the human gave directly, do not project.create to re-create |
 | Posting a file download URL (from `as.url` / `as.resolve`) into a chat message, delivery, comment, KB page or memory | Download URLs are short-lived and may be single-use, for this agent's own immediate fetch only. To read a file, `as.download` it and work on the local copy; to give a person a file, attach it by `artifactId` or use a durable link (`references/automation-delivery.md#durable-artifact-links`) |
-| Calling the TM/KB/AS API directly with curl/fetch / hand-rolling BFF REST paths | Always go through the CLI `src/cli/{tm,kb,as,comm,core,channel,usage}.js`, direct HTTP is forbidden (see the "Iron Rule of Service Calls" at the top); when unsure, first `node src/cli/<svc>.js` to see the commands or check the ops docs, do not guess paths |
+| Calling the TM/KB/AS API directly with curl/fetch / hand-rolling BFF REST paths | Always go through the CLI `src/cli/{tm,kb,as,comm,core,channel,usage,billing}.js`, direct HTTP is forbidden (see the "Iron Rule of Service Calls" at the top); when unsure, first `node src/cli/<svc>.js` to see the commands or check the ops docs, do not guess paths |
 | Task done but Attempt still running | First attempt.transition → done, then task.transition → done |
 | Work finished but the Issue is not delivered | After all Tasks are done you must `issue.deliver` |
 | The bot accepting / archiving on its own after delivery | After delivered you must **wait for the Issue owner human's acceptance to pass**; the bot does not call acceptance on their behalf |
@@ -889,12 +952,13 @@ Each org has an **independent** access policy under `orgs.<slug>` in `config.jso
 2. `open`? → respond when @-ed in any group
 3. `allowlist`? → only the groups configured in `access.groups`; in an unconfigured group only the owner being @-ed gets through, the rest are silently dropped
 4. In-group `allowFrom` non-empty and not `['*']`? → only the member_ids in the list are allowed (owner exempt)
-5. `mode: 'smart'`? → receive all messages in the group, no @ needed; `mode: 'mention'` (default) → only handle messages that @ the bot
+5. `mode: 'smart'`? → receive all messages in the group, no @ needed; `mode: 'mention'` (default) → only handle messages that @ the bot, or that are addressed to it in a group topic (see below)
 
 **Key points:**
 - `dmPolicy` and `groupPolicy` are fully independent, changing one does not affect the other
 - owner is only exempt from the allowlist / group-list check; `groupPolicy: disabled` blocks even the owner's group messages
 - A group's sub-conversations (topics) are gated by the **parent group's** `access.groups` entry, exactly like messages in the parent group; an entry under a sub-conversation's own conversation_id has no effect. A DM sub-conversation follows dmPolicy like any DM
+- In a group topic where you are the only agent that has replied, a person's message that @-mentions no agent is addressed to you without an @ (the message's `addressed_member_ids` holds your member_id). In `mention` mode it is handled as if you were @-ed; in `smart` mode nothing changes. It is not an @: it never triggers a refusal reply
 - Lists use `member_id`, not the display name; at install time `COCO_OWNER_MEMBER_ID` pre-binds the owner and implies `dmPolicy=owner`
 - Policies are configured per org (each org has an independent `access` block)
 
@@ -908,7 +972,7 @@ Each org has an **independent** access policy under `orgs.<slug>` in `config.jso
 - `waiting_dependency` means unfinished Task dependencies, not necessarily another Agent. Decide whether to contact the responsible Worker, unblock an upstream Task, reassign work, or ask a human to intervene.
 - When an `issue.idle` inspection leads to an actual action or a new decision, record it through normal Work actions/comments. If the dependency is unchanged and there is currently no action that can advance the Issue, do not write a routine “no change” or “continue monitoring” comment, do not invent progress, and do not repeat the same nudge. Leave the Issue activity clock unchanged so the scheduler can escalate to the owner in the next idle window. Do not reply to the Scheduler DM and do not ask the platform to message Workers automatically.
 
-**Making your own outbound `@name` actually wake someone:** everything above is about *inbound* mention/group gating. On the way out, `@name` in a message's text is plain text: it mentions nobody and wakes nobody (the platform never reads names out of the body). To mention someone, look up their `member_id` — `comm.member_list({conversationId})` for that conversation's roster (or `core.member_list({search:"<name>"})` when you don't have a conversationId yet) — and send a `[STRUCTURED]` body with `"mentions":["<member_id>"]` (keep `@name` in the text so people see it). A broadcast is `"mentions":[{"type":"all"}]` (reaches the human members only) or `[{"type":"all_agents"}]` (reaches the Agent members only; pass both to reach everyone), only when the message really is for everyone. It is allowed only where the conversation's `can_mention_all` is true (groups; the group's @all policy may limit it to the owner/admins): the send checks it first and otherwise fails with `code: "mention_all_not_allowed"` and sends nothing — it never drops the broadcast and sends anyway. See `comm-operations.md` for the exact mechanics.
+**Making your own outbound `@name` actually wake someone:** everything above is about *inbound* mention/group gating. On the way out, `@name` in a message's text is plain text: it mentions nobody and wakes nobody (the platform never reads names out of the body). To mention someone, look up their `member_id` — `comm.member_list({conversationId})` for that conversation's roster (or `core.member_list({search:"<name>"})` when you don't have a conversationId yet) — and send a `[STRUCTURED]` body with `"mentions":["<member_id>"]` (keep `@name` in the text so people see it) — or, for a file or image, a `[MENTIONS]["<member_id>"]` line right after the `[MEDIA:file]` / `[MEDIA:image]` path line. A broadcast is `"mentions":[{"type":"all"}]` (reaches the human members only) or `[{"type":"all_agents"}]` (reaches the Agent members only; pass both to reach everyone), only when the message really is for everyone. It is allowed only where the conversation's `can_mention_all` is true (groups; the group's @all policy may limit it to the owner/admins): the send checks it first and otherwise fails with `code: "mention_all_not_allowed"` and sends nothing — it never drops the broadcast and sends anyway. See `comm-operations.md` for the exact mechanics.
 
 ## Frontend Links (Frontend URL Patterns)
 
@@ -957,6 +1021,7 @@ knowledge base", never "gateway not connected".
 | **Core** | Identity + member/project/role/invitation directory queries + org switching + platform agent lifecycle | `core.me` to confirm identity, find dispatch candidates, send invitations, switch org | `references/core-operations.md` |
 | **Connect** | Third-party app connections (OAuth/API): list/status, action discovery + execute, and the app-keyed capability cache under `runtime/connect/` | **prefer for any request that touches an external app/account** — send/read mail, post/read messages, calendar, docs/files, trackers, etc.: `conn.list` → `conn.catalog {app}` → `conn.invoke {app, action, params}` (credential handled for you — `conn.invoke` auto-routes by `credential_mode`: `direct` = local token, called from your own egress; `proxy`/Composio = executed server-side, no local token); creating a custom connector for a user: `conn.create_card` first, `conn.app_import` only after the owner confirms | `references/conn-operations.md` |
 | **Channel** | Connect an inbound IM channel to this Agent; sends QR and terminal status back to the originating chat | owner/admin asks to connect Feishu/Lark/DingTalk/WeCom or requests its QR in the current chat: copy the exact ids from `<message-context>` into `channel.connect` | `references/channel-operations.md` |
+| **Billing** | Read-only credit balance / plan / renewal / per-Agent spend for org Owner/admin askers (initiator checked by the CLI) | someone asks how many credits are left, which plan, when it renews, which Agent spends the most | `references/billing-operations.md` |
 | **Onboarding** | A new Agent's guided first conversation: when each onboarding card is due, what to report, how to react to clicks | `ref: event=onboarding.start` wake, or owner messages while `core.onboarding_session` returns your record | `references/onboarding-lead.md` |
 
 The top of each Layer 3 doc has its own four-part summary of `Purpose` / `When to load this document` / `Out of scope for this document` / `Prerequisites`; after loading it into memory, first scan this section to confirm it is the one you want, then read on to the command list.
